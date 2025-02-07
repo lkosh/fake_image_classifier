@@ -20,36 +20,13 @@ import torch
 from freqnet import freqnet
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
-from dataset import RealFakeDataset
+from dataset import RealFakeTripletDataset, RealFakeShuffledDataset
 
-#layer classes 
-# class AttentionFusion(nn.Module):
-#     def __init__(self, feature_dim=256, num_heads=8, num_layers=2, dropout=0.1):
-#         super(AttentionFusion, self).__init__()
-#         encoder_layers = TransformerEncoderLayer(d_model=feature_dim, nhead=num_heads, dropout=dropout)
-#         self.transformer_encoder = TransformerEncoder(encoder_layers, num_layers=num_layers)
-#         self.fc = nn.Linear(feature_dim, feature_dim)
-#         self.relu = nn.ReLU()
 
-#     def forward(self, vit, facenet, freqnet):
-#         # Combine features into a sequence
-#         x = torch.stack([vit, facenet, freqnet], dim=1)  # Shape: (N, 3, D)
-#         x = x.permute(1, 0, 2)  # Transformer expects (Seq_len, Batch, D)
 
-#         # Apply Transformer Encoder
-#         x = self.transformer_encoder(x)  # Shape: (3, N, D)
-
-#         # Aggregate the sequence (e.g., take the mean)
-#         x = x.mean(dim=0)  # Shape: (N, D)
-
-#         # Optional: Further processing
-#         x = self.fc(x)
-#         x = self.relu(x)
-#         return x
-
-class AttentionFusion(nn.Module):
+class SimpleFusion(nn.Module):
     def __init__(self, feature_dim=256, num_heads=8, num_layers=2, dropout=0.1):
-        super(AttentionFusion, self).__init__()
+        super(SimpleFusion, self).__init__()
         self.fc = nn.Sequential(
             nn.Linear(in_features=3 * feature_dim, out_features=feature_dim),
             nn.ReLU()
@@ -60,8 +37,6 @@ class AttentionFusion(nn.Module):
         # Combine features into a sequence
         combined = torch.cat((vit, facenet, freqnet), dim=1)
         out = self.fc(combined)
-
-        
         return out
         
 class FeatureProjection(nn.Module):
@@ -163,18 +138,21 @@ class ArtifactDetector(nn.Module):
         self.freqnet_proj = FeatureProjection(freqnet_dim, common_dim)
 
         #feature fusion
-        self.attention_fusion = AttentionFusion(feature_dim=common_dim)
+        self.feature_fusion = SimpleFusion(feature_dim=common_dim)
         self.init_weights()
 
     def init_weights(self):
         #initialize freqnet:
         state_dict = torch.load(self.config.freqnet_weights, map_location=f"cuda:{self.gpu_id}")
         self.freqnet.load_state_dict(state_dict, strict=False)
-        #pytorch initializes layers with uniform distr.
-        #optional TODO: add more advanced weight init
-        # for layer in [self.face_aux, self.face_net.modules()]:
+
+        #TODO initialize classification layer
+        # for layer in self.classifier.modules():
         #     nn.init.xavier_uniform_(layer.weight)
         #     nn.init.zeros_(layer.bias)
+        #pytorch initializes layers with uniform distr.
+        #optional TODO: add more advanced weight init
+      
         
     def forward(self, rgb):
         batch_dim = rgb.size(0)#
@@ -183,7 +161,8 @@ class ArtifactDetector(nn.Module):
         # vit_feat = self.vit_fc(vit_out)
         
         # Frequency branch
-        fft_feat = self.freqnet(rgb).squeeze() #512 channels
+        fft_feat = self.freqnet(rgb)
+        fft_feat = fft_feat.squeeze() #512 channels
 
         mtcnn_sus = False
         batch_boxes, batch_probs, batch_points = None, None, None
@@ -212,20 +191,21 @@ class ArtifactDetector(nn.Module):
         face_feat = self.face_net(batch_boxes, batch_probs, batch_points)
 
         vit_proj = self.vit_proj(vit_out)
-        # facenet_proj = self.facenet_proj(facenet)  # Shape: (N, 256)
-        freqnet_proj = self.freqnet_proj(fft_feat)  # Shape: (N, 256)
+        freqnet_feat = self.freqnet_proj(fft_feat)  # Shape: (N, 256)
         
         # Fuse features using Attention
-        fused_features = self.attention_fusion(vit_proj, face_feat, freqnet_proj)  # Shape: (N, 256)
-        
+        fused_features = self.feature_fusion(vit_proj, face_feat, freqnet_feat)  # Shape: (N, 256)
+        #Deepseek suggested removing normalization
+        # embeddings = nn.functional.normalize(fused_features, p=2, dim=1)
         # Combine features
         
         # Outputs
-        main_out = self.classifier(fused_features)
-        #2 losses overcomplicate things, we're not trying to train a face detector!
-        # aux_out = self.face_aux(face_feat) 
+        main_out = self.classifier(embeddings)
+        main_out = main_out.squeeze()
+
+        embeddings = embeddings.squeeze()
         
-        return main_out.squeeze()
+        return main_out, embeddings
 
 # Training Components
 class FocalLoss(nn.Module):
@@ -240,140 +220,3 @@ class FocalLoss(nn.Module):
         F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
         return F_loss.mean()
 
-# def train_model(config):
-#     scaler = GradScaler()
-#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-#     eval_metric = evaluate.load('f1')
-    
-#     history = {
-#         "train_loss_main": [],
-#         "train_loss_aux":[],
-#         "val_loss": [],
-#         "val_f1": []
-#     }
-
-        
-#     # Log the model architecture
-
-
-    
-#     # Initialize model
-#     model = ArtifactDetector().to(device)
-    
-#     with open(f"{Config.save_dir}/model_architecture.txt", "w") as f:
-#         f.write(str(model))
-#     # with open(f"{Config.save_dir}/Config.json", "w") as f:
-#     #     json.dump(Config.to_dict(), f)
-    
-        
-#     optimizer = optim.AdamW(model.parameters(), lr=config["lr"])
-#     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.num_epochs)
-    
-#     # Losses
-#     main_criterion = FocalLoss()
-#     aux_criterion = nn.BCEWithLogitsLoss()
-    
-#     # Data
-#     train_set = RealFakeDataset("/root/research/dataset", "train")
-#     val_set = RealFakeDataset("/root/research/dataset", "eval")
-    
-#     train_loader = DataLoader(train_set, batch_size=config["batch_size"], shuffle=True)
-#     val_loader = DataLoader(val_set, batch_size=config["batch_size"])
-
-#     best_f1 = 0
-#     # Training loop
-#     train_loss_main = 0
-#     train_loss_aux= 0
-#     for epoch in range(Config.num_epochs):
-#         model.train()
-#         for batch in train_loader:
-#             real_rgb = batch["real"]
-#             fake_rgb = batch["fake"]
-            
-#             # Combine real and fake samples
-#             rgb = torch.cat([real_rgb, fake_rgb]).to(device)
-#             labels = torch.cat([
-#                 torch.zeros(len(real_rgb)),
-#                 torch.ones(len(fake_rgb))
-#             ]).to(device)
-#             has_face = torch.cat([batch["has_face"], batch["has_face"]]).to(device)
-            
-#             # Forward
-#             main_out, aux_out = model(rgb)
-#             loss_main = main_criterion(main_out, labels)
-#             loss_aux = aux_criterion(aux_out, has_face)
-#             total_loss = loss_main + Config.aux_lambda * loss_aux
-#             train_loss_main += loss_main.item()
-#             train_loss_aux += loss_aux.item()
-            
-#             # Backward
-#             optimizer.zero_grad()
-#             total_loss.backward()
-#             optimizer.step()
-#         print (f"Epoch {epoch} main train loss: {train_loss_main / len(train_loader)}, aux train loss: {train_loss_aux/len(train_loader)}")
-#         history["train_loss_main"].append(train_loss_main / len(train_loader))
-#         history['train_loss_aux'].append(train_loss_aux/len(train_loader))
-
-#         # Validation
-#         model.eval()
-#         val_loss_main = 0
-#         val_loss_total =0
-#         val_f1_total = 0
-#         with torch.no_grad():
-#             for batch in val_loader:
-#                 real_rgb = batch["real"]
-#                 fake_rgb= batch["fake"]
-                
-#                 # Combine real and fake samples
-#                 rgb = torch.cat([real_rgb, fake_rgb]).to(device)
-#                 labels = torch.cat([
-#                     torch.zeros(len(real_rgb)),
-#                     torch.ones(len(fake_rgb))
-#                 ]).to(device)
-#                 has_face = torch.cat([batch["has_face"], batch["has_face"]]).to(device)
-                
-#                 # Forward
-#                 main_out, aux_out = model(rgb)
-#                 probs = torch.sigmoid(main_out) #we got 1 output neuron 
-#                 predictions = (probs > 0.5).float()
-                
-#                 val_f1 = eval_metric.compute(predictions=predictions, references=labels)['f1']
-#                 val_loss_main = main_criterion(main_out, labels)
-#                 val_loss_total += val_loss_main.item()
-#                 val_f1_total += val_f1
-#                 # val_loss_aux = aux_criterion(aux_out, has_face)
-#                 # total_loss = loss_main + 0.3 * loss_aux
-#             print (f"Epoch {epoch} eval loss: {val_loss_main/ len(val_loader)}, f1: {val_f1_total/len(val_loader)}")
-#             history["val_loss"].append(val_loss_total)
-#             history["val_f1"].append(val_f1_total)
-
-
-#         # Log metrics
-       
-        
-#         if val_f1 > best_f1:
-#                 best_f1 = val_f1
-#                 torch.save(model.state_dict(), f"{Config.save_dir}/best_model.pth")
-        
-#         # Final logging
-        
-        
-#         scheduler.step()
-#     return history
-
-#     # tune.report(val_f1=val_f1)
-
-
-# # Main Execution
-# if __name__ == "__main__":
-#     cfg = {
-#         'lr':1e-6,
-#         'batch_size':1
-#     }
-        
-#     history = train_model(cfg)
-#     with open(f"{Config.save_dir}/train_logs.pkl", "wb") as f:
-#         pkl.dump(history, f)
-#     # tune_model() dont need tuning yet
-    
